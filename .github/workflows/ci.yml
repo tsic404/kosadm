@@ -1,0 +1,55 @@
+name: CI
+
+# The check a pull request can show before it is merged. The steps mirror the
+# Makefile entry points one to one: build, formatting and vet run on their own,
+# then the unit and acceptance suites run against a real API server. The pinned
+# control-plane version is read from the Makefile, which is its only
+# declaration.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: make build
+
+      - name: Format and vet
+        run: make lint
+
+      - name: Read the pinned envtest version
+        id: envtest
+        run: echo "version=$(make -s envtest-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache envtest binaries
+        uses: actions/cache@v4
+        with:
+          path: bin/envtest
+          key: envtest-${{ runner.os }}-${{ runner.arch }}-v${{ steps.envtest.outputs.version }}
+
+      - name: Unit and acceptance tests
+        run: make test
+
+      - name: Acceptance suite
+        run: make acceptance
