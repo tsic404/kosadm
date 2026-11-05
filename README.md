@@ -26,3 +26,14 @@ kosadm bootstrap --definitions <CRD 目录> --identity-database <控制面数据
 
 `install --external` 走外置控制面形态：`--control-plane-kubeconfig` 指向运行控制面的集群，
 `--kubeconfig` 指向被管集群；首个 Owner 的口令只经安装输出给出的引导端点领取一次。
+
+```bash
+kosadm uninstall [--namespace <名称>] [--mode existing-cluster|bootstrap|external-control-plane] \
+                 [--control-plane-kubeconfig <路径>] [--data retain]
+kosadm rescue    [--resource <group/version/resource | version/resource>]... [--namespace <名称>]
+kosadm status    [--namespace <名称>]
+```
+
+`uninstall` 默认保留数据并输出六类遗留清单，同时移除控制面与节点代理及其身份与权限；
+数据删除只能走卷路径（KOSD-C-04），命令不提供一键清空。`rescue` 只读原生资源，不写对象、
+不启动调和。`status` 只读地报告安装命名空间、控制面副本、对象定义与组件就绪状态。
