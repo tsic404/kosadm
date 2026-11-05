@@ -36,7 +36,10 @@ func usage(w io.Writer) {
 Usage:
   kosadm install   [flags]   install into a cluster that already runs
   kosadm bootstrap [flags]   bring the run kernel up on a bare host, then install
+  kosadm upgrade   <form>    move a running KOS to a newer release
   kosadm help                print this text
+
+The upgrade forms are described by: kosadm upgrade help
 
 Every form needs the release's object definition manifests:
   --definitions <dir>        directory of the release's CRD manifests
@@ -73,6 +76,8 @@ func run(args []string, out io.Writer) error {
 		return runInstall(args[1:], out)
 	case "bootstrap":
 		return runBootstrap(args[1:], out)
+	case "upgrade":
+		return runUpgrade(args[1:], out)
 	case "help", "-h", "--help":
 		usage(out)
 		return nil
