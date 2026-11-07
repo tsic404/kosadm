@@ -37,6 +37,9 @@ Usage:
   kosadm install   [flags]   install into a cluster that already runs
   kosadm bootstrap [flags]   bring the run kernel up on a bare host, then install
   kosadm upgrade   <form>    move a running KOS to a newer release
+  kosadm uninstall [flags]   remove an installation and print the leftover manifest
+  kosadm rescue    [flags]   read native resources without writing them
+  kosadm status    [flags]   report the installation and its components
   kosadm help                print this text
 
 The upgrade forms are described by: kosadm upgrade help
@@ -44,7 +47,7 @@ The upgrade forms are described by: kosadm upgrade help
 Every form needs the release's object definition manifests:
   --definitions <dir>        directory of the release's CRD manifests
 
-The first Owner is created in the control-plane database:
+Every install form creates the first Owner in the control-plane database:
   --identity-database <path> the database the control plane serves
 
 The install window (C-15) is measured from the API server audit log:
@@ -78,6 +81,12 @@ func run(args []string, out io.Writer) error {
 		return runBootstrap(args[1:], out)
 	case "upgrade":
 		return runUpgrade(args[1:], out)
+	case "uninstall":
+		return runUninstall(args[1:], out)
+	case "rescue":
+		return runRescue(args[1:], out)
+	case "status":
+		return runStatus(args[1:], out)
 	case "help", "-h", "--help":
 		usage(out)
 		return nil
