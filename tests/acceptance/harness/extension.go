@@ -57,13 +57,13 @@ func (c *Cluster) InstallPackage(t *testing.T, name string, declaration extensio
 // pass that settles preference retention through sink (C-27, C-29).
 func (c *Cluster) InstallPackageWith(t *testing.T, name string, declaration extension.Declaration, artifacts extension.MemoryArtifacts, sink extension.PreferenceRetention) *extension.Installation {
 	t.Helper()
-	content, err := extension.Marshal(declaration)
+	content, digest, err := extension.Pack(declaration, nil)
 	if err != nil {
-		t.Fatalf("marshal declaration %s: %v", name, err)
+		t.Fatalf("pack declaration %s: %v", name, err)
 	}
 	reference := "test://" + name
 	artifacts[reference] = content
-	c.Create(t, &unstructured.Unstructured{Object: Component(name, reference, extension.DigestOf(content))})
+	c.Create(t, &unstructured.Unstructured{Object: Component(name, reference, digest)})
 	return c.ExtensionStateWith(t, artifacts, sink)
 }
 
@@ -71,9 +71,9 @@ func (c *Cluster) InstallPackageWith(t *testing.T, name string, declaration exte
 // declaration and runs the install pass again (C-17).
 func (c *Cluster) UpgradePackage(t *testing.T, name string, declaration extension.Declaration, artifacts extension.MemoryArtifacts) *extension.Installation {
 	t.Helper()
-	content, err := extension.Marshal(declaration)
+	content, digest, err := extension.Pack(declaration, nil)
 	if err != nil {
-		t.Fatalf("marshal declaration %s: %v", name, err)
+		t.Fatalf("pack declaration %s: %v", name, err)
 	}
 	reference := "test://" + name
 	artifacts[reference] = content
@@ -84,7 +84,7 @@ func (c *Cluster) UpgradePackage(t *testing.T, name string, declaration extensio
 	if err != nil {
 		t.Fatalf("read component %s: %v", name, err)
 	}
-	if err := unstructured.SetNestedField(component.Object, extension.DigestOf(content), "spec", "package", "digest"); err != nil {
+	if err := unstructured.SetNestedField(component.Object, digest, "spec", "package", "digest"); err != nil {
 		t.Fatalf("set package digest of %s: %v", name, err)
 	}
 	if err := unstructured.SetNestedField(component.Object, reference, "spec", "package", "reference"); err != nil {

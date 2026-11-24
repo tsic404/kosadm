@@ -64,7 +64,7 @@ type Identity struct {
 // next. next may be nil when the case needs only the identity routes.
 func StartIdentity(t *testing.T, next http.Handler, owned identity.OwnedObjects) *Identity {
 	t.Helper()
-	surface := startIdentity(t, owned, nil)
+	surface := startIdentity(t, filepath.Join(t.TempDir(), "kos.db"), owned, nil)
 	surface.Serve(t, next)
 	return surface
 }
@@ -73,14 +73,21 @@ func StartIdentity(t *testing.T, next http.Handler, owned identity.OwnedObjects)
 // surface can mount the account middleware in front of its own routes.
 func OpenIdentity(t *testing.T, owned identity.OwnedObjects, configure func(*identity.Config)) *Identity {
 	t.Helper()
-	return startIdentity(t, owned, configure)
+	return startIdentity(t, filepath.Join(t.TempDir(), "kos.db"), owned, configure)
+}
+
+// OpenIdentityAt opens the database at path without serving it, the way the
+// control plane opens the database its rendering names. A case uses it to read
+// the file the workload serves instead of the one the installation opened.
+func OpenIdentityAt(t *testing.T, path string, owned identity.OwnedObjects, configure func(*identity.Config)) *Identity {
+	t.Helper()
+	return startIdentity(t, path, owned, configure)
 }
 
 // startIdentity opens the private database and builds the account service.
-func startIdentity(t *testing.T, owned identity.OwnedObjects, configure func(*identity.Config)) *Identity {
+func startIdentity(t *testing.T, databasePath string, owned identity.OwnedObjects, configure func(*identity.Config)) *Identity {
 	t.Helper()
 	clock := NewClock(time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC))
-	databasePath := filepath.Join(t.TempDir(), "kos.db")
 	store, err := identity.Open(context.Background(), identity.OpenOptions{Path: databasePath, Now: clock.Now})
 	if err != nil {
 		t.Fatalf("open identity database: %v", err)

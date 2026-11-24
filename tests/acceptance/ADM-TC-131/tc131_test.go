@@ -37,19 +37,26 @@ func TestTC131ExistingClusterInstallCompletes(t *testing.T) {
 	installerIdentity := harness.InstallerIdentity()
 	cluster.GrantClusterAdmin(t, installerIdentity)
 	accounts := harness.OpenIdentity(t, nil, nil)
+	cluster.RegisterControlPlaneNode(t)
+	database, err := install.SeededDatabase(accounts.DatabasePath, harness.ControlPlaneNode)
+	if err != nil {
+		t.Fatalf("resolve the database the installation seeds: %v", err)
+	}
 	clients := cluster.InstallClients(t, installerIdentity)
 
 	runner, err := install.New(install.Config{
 		NoNodeAgentController: true,
-		Plan:                  harness.InstallerPlan(nil),
-		Dynamic:               clients.Dynamic,
-		Kube:                  clients.Kube,
-		APIExtensions:         clients.APIExtensions,
-		Definitions:           harness.Definitions(t),
-		Accounts:              accounts.Service,
-		Audit:                 cluster.AuditSource(t),
-		QuietWindow:           200 * time.Millisecond,
-		SettleTimeout:         30 * time.Second,
+		Plan: harness.InstallerPlan(func(plan *install.Plan) {
+			plan.Database = &database
+		}),
+		Dynamic:       clients.Dynamic,
+		Kube:          clients.Kube,
+		APIExtensions: clients.APIExtensions,
+		Definitions:   harness.Definitions(t),
+		Accounts:      accounts.Service,
+		Audit:         cluster.AuditSource(t),
+		QuietWindow:   200 * time.Millisecond,
+		SettleTimeout: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("build installer: %v", err)
@@ -74,7 +81,7 @@ func TestTC131ExistingClusterInstallCompletes(t *testing.T) {
 
 	// ADM-C-54: the installation delivers the three artifacts — the control
 	// plane, the per-node agent and the management CLI.
-	assertThreeArtifacts(t, cluster)
+	assertThreeArtifacts(t, cluster, database)
 
 	// The control plane reads and writes the cluster: the application is
 	// created and read back through its API (C-12), then reconciled to Ready.
@@ -97,42 +104,46 @@ func TestTC131ExistingClusterInstallCompletes(t *testing.T) {
 	}
 
 	// ADM-AC-70: the printed credential signs the first Owner in and the first
-	// login must replace it.
+	// login must replace it. The control plane reads the database the rendering
+	// names, not the one the installation process happened to open: a second
+	// service on that file is the pod's view, and the empty database it served
+	// before this was fixed refused exactly this login.
 	if result.Owner == "" || result.OneTimePassword == "" {
 		t.Fatalf("install output = owner %q password %q, want the first Owner's credential",
 			result.Owner, result.OneTimePassword)
 	}
-	login, err := accounts.Service.Login(ctx, result.Owner, result.OneTimePassword)
+	controlPlane := harness.OpenIdentityAt(t, database.Path, nil, nil)
+	login, err := controlPlane.Service.Login(ctx, result.Owner, result.OneTimePassword)
 	if err != nil {
-		t.Fatalf("sign the first Owner in with the printed password: %v", err)
+		t.Fatalf("sign the first Owner in against the database the workload serves: %v", err)
 	}
 	if !login.Session.MustChangePassword {
 		t.Fatal("the first login was not required to change the one-time password")
 	}
-	otherSession, err := accounts.Service.Login(ctx, result.Owner, result.OneTimePassword)
+	otherSession, err := controlPlane.Service.Login(ctx, result.Owner, result.OneTimePassword)
 	if err != nil {
 		t.Fatalf("open another session of the first Owner: %v", err)
 	}
-	bob, err := accounts.Service.CreateAccount(ctx, login.Session, identity.NewAccount{
+	bob, err := controlPlane.Service.CreateAccount(ctx, login.Session, identity.NewAccount{
 		Username: "bob", Role: write.RoleMember,
 	})
 	if err != nil {
 		t.Fatalf("create another account: %v", err)
 	}
-	bobLogin, err := accounts.Service.Login(ctx, "bob", bob.OneTimePassword)
+	bobLogin, err := controlPlane.Service.Login(ctx, "bob", bob.OneTimePassword)
 	if err != nil {
 		t.Fatalf("sign the other account in: %v", err)
 	}
-	if err := accounts.Service.ChangePassword(ctx, login.Token, result.OneTimePassword, "owner-password"); err != nil {
+	if err := controlPlane.Service.ChangePassword(ctx, login.Token, result.OneTimePassword, "owner-password"); err != nil {
 		t.Fatalf("replace the one-time password: %v", err)
 	}
-	if _, err := accounts.Service.Authenticate(ctx, login.Token); err != nil {
+	if _, err := controlPlane.Service.Authenticate(ctx, login.Token); err != nil {
 		t.Fatalf("the session that changed the password was revoked: %v", err)
 	}
-	if _, err := accounts.Service.Authenticate(ctx, otherSession.Token); err == nil {
+	if _, err := controlPlane.Service.Authenticate(ctx, otherSession.Token); err == nil {
 		t.Fatal("another session of the account survived the password change")
 	}
-	if _, err := accounts.Service.Authenticate(ctx, bobLogin.Token); err != nil {
+	if _, err := controlPlane.Service.Authenticate(ctx, bobLogin.Token); err != nil {
 		t.Fatalf("another account's session was disturbed by the password change: %v", err)
 	}
 }
@@ -140,13 +151,16 @@ func TestTC131ExistingClusterInstallCompletes(t *testing.T) {
 // assertThreeArtifacts checks the artifacts an installation delivers (C-54):
 // the control-plane workload, one node agent per node, and the management CLI.
 // The node agent is a DaemonSet, which is what makes it one instance per node.
-func assertThreeArtifacts(t *testing.T, cluster *harness.Cluster) {
+func assertThreeArtifacts(t *testing.T, cluster *harness.Cluster, database install.DatabaseDelivery) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, err := cluster.Kube.AppsV1().Deployments(install.DefaultNamespace).Get(ctx, install.ControlPlaneName, metav1.GetOptions{}); err != nil {
+	deployment, err := cluster.Kube.AppsV1().Deployments(install.DefaultNamespace).Get(ctx, install.ControlPlaneName, metav1.GetOptions{})
+	if err != nil {
 		t.Fatalf("the installation delivered no control plane: %v", err)
 	}
+	harness.AssertPackageDirectory(t, deployment)
+	harness.AssertDatabaseDelivery(t, deployment, database)
 	agent, err := cluster.Kube.AppsV1().DaemonSets(install.DefaultNamespace).Get(ctx, install.NodeAgentName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("the installation delivered no node agent: %v", err)

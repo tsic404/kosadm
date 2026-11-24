@@ -687,6 +687,27 @@ func TestUpgradeRefusesAConfigurationItCannotHonour(t *testing.T) {
 	}
 }
 
+// TestUpgradeRefusesADatabaseDeliveryWithoutItsNode pins the last layer before a
+// write: the workload mounts the database from one node's filesystem, so a
+// delivery that names no node can land the replacement on a machine whose copy
+// of the path is another database, and the accounts the running control plane
+// serves would be gone (C-54, C-55). Nothing upstream is trusted to have filled
+// the pin: the upgrade itself refuses and writes nothing.
+func TestUpgradeRefusesADatabaseDeliveryWithoutItsNode(t *testing.T) {
+	world := newUpgradeWorld(t)
+	world.config.Plan.Database = &DatabaseDelivery{
+		Path:  "/var/lib/kosd/kos.db",
+		Owner: DatabaseIdentity{UID: 1000, GID: 1000},
+	}
+
+	if _, err := Upgrade(context.Background(), world.config); err == nil {
+		t.Fatal("an upgrade rendering a database delivery with no node was accepted")
+	}
+	if len(world.order.steps) != 0 {
+		t.Fatalf("the refused upgrade wrote %v", world.order.steps)
+	}
+}
+
 // workloadImage reads the image the control-plane workload runs in the cluster
 // the case upgrades.
 func workloadImage(t *testing.T, client dynamic.Interface) string {

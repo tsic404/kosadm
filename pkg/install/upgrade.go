@@ -169,6 +169,15 @@ func (c UpgradeConfig) normalize() (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
+	// An upgrade rewrites a workload that mounts the database from one node's
+	// filesystem, so the delivery it renders has to name that node: without the
+	// pin the replacement can land on a machine whose copy of the path is
+	// another database, and the accounts the running control plane serves would
+	// be gone (C-54, C-55). A delivery that names no node carries no evidence
+	// behind the pin, so the upgrade stops before it writes.
+	if plan.Database != nil && plan.Database.Node == "" {
+		return Plan{}, fmt.Errorf("the upgrade would render the control-plane database %s without the node that holds it", plan.Database.Path)
+	}
 	switch {
 	case plan.Mode == ModeExternal && c.ControlPlaneCluster == nil:
 		return Plan{}, errors.New("an external-control-plane upgrade needs the control-plane cluster's clients")

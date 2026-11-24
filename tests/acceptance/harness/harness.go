@@ -36,6 +36,62 @@ import (
 // Namespace is where namespaced kernel objects of the acceptance cases live.
 const Namespace = "default"
 
+// ControlPlaneNode is the node the acceptance cases pin the control plane to.
+// The database is a hostPath, so the workload is pinned to the node that holds
+// the file; the case registers that node and passes the same name as the pin.
+// The node's hostname label deliberately differs from its name, so the cases
+// prove the pin follows the node's identity, not its label.
+const (
+	ControlPlaneNode         = "kos-control-plane-node"
+	ControlPlaneNodeHostname = "kos-control-plane-hostname"
+)
+
+// RegisterControlPlaneNode creates the node the control-plane workload is pinned
+// to, with a hostname label that differs from its name, proving the pin binds
+// the node's identity.
+func (c *Cluster) RegisterControlPlaneNode(t *testing.T) {
+	t.Helper()
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   ControlPlaneNode,
+			Labels: map[string]string{"kubernetes.io/hostname": ControlPlaneNodeHostname},
+		},
+	}
+	if _, err := c.Kube.CoreV1().Nodes().Create(t.Context(), node, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("register the control-plane node: %v", err)
+	}
+}
+
+// RegisterNode creates a node that reports hostname as the machine it runs on,
+// so a case controls which node a host name resolves to.
+func (c *Cluster) RegisterNode(t *testing.T, name, hostname string) {
+	t.Helper()
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:   name,
+		Labels: map[string]string{corev1.LabelHostname: hostname},
+	}}
+	if _, err := c.Kube.CoreV1().Nodes().Create(t.Context(), node, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("register node %s: %v", name, err)
+	}
+}
+
+// HostShortName is this machine's name without its domain, the way a node
+// registers itself.
+func HostShortName(t *testing.T) string {
+	t.Helper()
+	name, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("read this host's name: %v", err)
+	}
+	if name == "" {
+		t.Fatal("this host reports no name")
+	}
+	if cut := strings.IndexByte(name, '.'); cut > 0 {
+		return name[:cut]
+	}
+	return name
+}
+
 // requestTimeout bounds every API call so a wedged server fails the case.
 const requestTimeout = 30 * time.Second
 
