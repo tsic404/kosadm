@@ -7,15 +7,25 @@
 package admtc95
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/tsic404/kosadm/pkg/install"
 	"github.com/tsic404/kosadm/pkg/maintenance"
 	"github.com/tsic404/kosadm/pkg/upgrade"
 	"github.com/tsic404/kosadm/tests/acceptance/harness"
@@ -207,7 +217,7 @@ func TestTC95UpgradePreflightStopsAndRestores(t *testing.T) {
 
 	// The cordon is recorded as the operator's action, so the node setting
 	// reports planned maintenance for the window (C-14, C-65).
-	if entries := maintenanceRecords(t, surface, nodeName); len(entries) == 0 ||
+	if entries := acceptedMaintenanceRecords(t, surface, nodeName); len(entries) == 0 ||
 		entries[0].Verb != controlplane.VerbMaintain || entries[0].Actor != ownerName {
 		t.Fatalf("newest maintenance record = %+v, want an accepted maintain by %s", entries, ownerName)
 	}
@@ -232,7 +242,7 @@ func TestTC95UpgradePreflightStopsAndRestores(t *testing.T) {
 	if !cluster.ClaimExists(t, appsNamespace, claimName) || cluster.VolumeNode(t, appsNamespace, volumeName) != nodeName {
 		t.Fatal("the data moved during the upgrade")
 	}
-	if entries := maintenanceRecords(t, surface, nodeName); len(entries) == 0 ||
+	if entries := acceptedMaintenanceRecords(t, surface, nodeName); len(entries) == 0 ||
 		entries[0].Verb != controlplane.VerbRestore || entries[0].Actor != ownerName {
 		t.Fatalf("newest maintenance record = %+v, want an accepted restore by %s", entries, ownerName)
 	}
@@ -408,14 +418,29 @@ func maintenanceService(cluster *harness.Cluster, auditor controlplane.Auditor) 
 	}
 }
 
-// maintenanceRecords reads one node's accepted maintenance records the way the
-// settings projection reads them (C-14, C-65).
-func maintenanceRecords(t *testing.T, surface *harness.Identity, node string) []identity.AuditEntry {
+// acceptedMaintenanceRecords reads one node's accepted maintenance records the
+// way the settings projection reads them (C-14, C-65).
+func acceptedMaintenanceRecords(t *testing.T, surface *harness.Identity, node string) []identity.AuditEntry {
 	t.Helper()
 	entries, err := surface.Store.RecentAuditEntriesForObject(context.Background(),
 		api.Group+"/Node/"+node,
 		[]string{controlplane.VerbMaintain, controlplane.VerbRestore},
 		[]string{controlplane.ResultAccepted}, 10)
+	if err != nil {
+		t.Fatalf("read the maintenance trail of %s: %v", node, err)
+	}
+	return entries
+}
+
+// maintenanceTrailRecords reads every record of the two writes the criterion
+// names, whatever the outcome: a failed or rejected attempt is a removal or
+// restore record the criterion forbids too (C-14, ADM-C-56).
+func maintenanceTrailRecords(t *testing.T, surface *harness.Identity, node string) []identity.AuditEntry {
+	t.Helper()
+	entries, err := surface.Store.RecentAuditEntriesForObject(context.Background(),
+		api.Group+"/Node/"+node,
+		[]string{controlplane.VerbMaintain, controlplane.VerbRestore},
+		nil, 20)
 	if err != nil {
 		t.Fatalf("read the maintenance trail of %s: %v", node, err)
 	}
@@ -477,4 +502,375 @@ func boundVolume() *unstructured.Unstructured {
 // only reports whether values holds exactly want.
 func only(values []string, want string) bool {
 	return len(values) == 1 && values[0] == want
+}
+
+// TestTC95AlreadyCordonedNodeKeepsItsCordon covers the criterion that a node
+// already out of scheduling when the upgrade starts takes no second cordon
+// write, leaves no removal record and keeps its maintenance attribution
+// (ADM-AC-48, ADM-TC-95).
+func TestTC95AlreadyCordonedNodeKeepsItsCordon(t *testing.T) {
+	cluster := harness.StartAudited(t)
+	surface := harness.OpenIdentity(t, nil, nil)
+	cluster.CreateNode(t, nodeName, fromVersion)
+	cordonNode(t, cluster, nodeName)
+
+	originBefore := maintenanceOrigin(t, cluster, surface, nodeName)
+	if originBefore == kossettings.MaintenancePlanned {
+		t.Fatalf("the node already reports %q before the upgrade", originBefore)
+	}
+	// The window opens after the case's own cordon, so only the upgrade's own
+	// requests remain in it.
+	windowStart := time.Now()
+	trailBefore := len(maintenanceTrailRecords(t, surface, nodeName))
+
+	flow := &upgrade.Flow{
+		Maintenance:  maintenanceService(cluster, surface.Trail),
+		Applications: upgrade.ClusterApplications{Dynamic: cluster.Dynamic},
+		Nodes:        upgrade.ClusterNodes{Dynamic: cluster.Dynamic},
+		Poll:         20 * time.Millisecond,
+		Wait:         60 * time.Second,
+	}
+	request := upgrade.Request{Nodes: []string{nodeName}, Version: targetVersion, Downtime: downtime}
+
+	begun, failure := flow.Begin(context.Background(), request, ownerName)
+	if failure != nil {
+		t.Fatalf("begin the upgrade on an already cordoned node: %v", failure)
+	}
+	if len(begun.Cordoned) != 0 {
+		t.Fatalf("the upgrade recorded cordons %v, want none for a node another writer already took out", begun.Cordoned)
+	}
+	if len(begun.Nodes) != 1 || begun.Nodes[0].Node != nodeName {
+		t.Fatalf("node results = %+v, want the already cordoned node maintained", begun.Nodes)
+	}
+	if !cluster.NodeUnschedulable(t, nodeName) {
+		t.Fatal("the upgrade made the already cordoned node schedulable")
+	}
+
+	// The operator's own version report is not part of this window: it is the
+	// node write the operator makes, not one the upgrade makes, and the case
+	// judges only the latter (ADM-C-56).
+	if _, failure := flow.Finish(context.Background(), begun, ownerName); failure != nil {
+		t.Fatalf("finish the upgrade: %v", failure)
+	}
+	if !cluster.NodeUnschedulable(t, nodeName) {
+		t.Fatal("the upgrade lifted a cordon it did not write")
+	}
+	// The audit log records the write request, not the value it wrote, so a
+	// write that leaves the unschedulable field at the value it already held is
+	// counted too (ADM-C-56).
+	if writes := nodeWriteRequests(t, cluster, nodeName, windowStart); len(writes) != 0 {
+		t.Fatalf("the upgrade sent %d write requests to the already cordoned node, want none: %+v", len(writes), writes)
+	}
+	if entries := maintenanceTrailRecords(t, surface, nodeName); len(entries) != trailBefore {
+		t.Fatalf("maintenance records = %+v, want only the %d the node already had, whatever their result", entries, trailBefore)
+	}
+	if originAfter := maintenanceOrigin(t, cluster, surface, nodeName); originAfter != originBefore {
+		t.Fatalf("maintenance origin = %q after the upgrade, want %q unchanged", originAfter, originBefore)
+	}
+}
+
+// tamperedShortName marks a definition manifest the refused upgrade must never
+// apply, so a served definition carrying it proves the object definitions were
+// replaced (ADM-AC-48, ADM-TC-95).
+const tamperedShortName = "tampered"
+
+// TestTC95NodeUpgradeRefusesAnUndeclaredOrUnusableControlPlaneDatabase covers
+// the criterion that a node upgrade without a declared control-plane database,
+// or with one whose location cannot hold records, is refused with the reason,
+// leaves the node schedulable, writes no maintenance record and replaces no
+// object definition (ADM-AC-48, ADM-TC-95).
+func TestTC95NodeUpgradeRefusesAnUndeclaredOrUnusableControlPlaneDatabase(t *testing.T) {
+	cluster := harness.StartAudited(t)
+	cluster.CreateNode(t, nodeName, fromVersion)
+
+	binary := buildManagementCLI(t)
+	kubeconfig := writeKubeconfig(t, cluster)
+	definitions := alteredDefinitions(t, harness.CRDDirectory(t))
+
+	cases := []struct {
+		name     string
+		database func(t *testing.T) (string, bool)
+		// inspect observes the location the CLI was pointed at after the
+		// refusal, so the case judges the database the upgrade really used.
+		inspect  func(t *testing.T, path string)
+		reason   string
+		exitCode int
+	}{
+		{
+			name:     "not declared",
+			database: func(*testing.T) (string, bool) { return "", false },
+			reason:   "--identity-database is required",
+			exitCode: 2,
+		},
+		{
+			name: "location does not exist",
+			database: func(t *testing.T) (string, bool) {
+				return filepath.Join(t.TempDir(), "control-plane.db"), true
+			},
+			inspect: func(t *testing.T, path string) {
+				t.Helper()
+				if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("the refused upgrade created the database %s: %v", path, err)
+				}
+			},
+			reason:   "does not exist",
+			exitCode: 2,
+		},
+		{
+			name: "location is not a regular file",
+			database: func(t *testing.T) (string, bool) {
+				return t.TempDir(), true
+			},
+			inspect: func(t *testing.T, path string) {
+				t.Helper()
+				entries, err := os.ReadDir(path)
+				if err != nil {
+					t.Fatalf("read the refused database directory %s: %v", path, err)
+				}
+				if len(entries) != 0 {
+					t.Fatalf("the refused upgrade created %d entries under %s", len(entries), path)
+				}
+			},
+			reason:   "not a regular file",
+			exitCode: 2,
+		},
+		{
+			name: "location exists but cannot be read or written",
+			database: func(t *testing.T) (string, bool) {
+				if os.Geteuid() == 0 {
+					t.Skip("a root runner reads and writes a 0o000 file, so the location cannot be made unusable")
+				}
+				path := filepath.Join(t.TempDir(), "control-plane.db")
+				store, err := identity.Open(context.Background(), identity.OpenOptions{Path: path})
+				if err != nil {
+					t.Fatalf("create the control-plane database %s: %v", path, err)
+				}
+				if err := store.Close(); err != nil {
+					t.Fatalf("close the control-plane database %s: %v", path, err)
+				}
+				if err := os.Chmod(path, 0o000); err != nil {
+					t.Fatalf("make the control-plane database %s unreadable: %v", path, err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+				return path, true
+			},
+			inspect: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Chmod(path, 0o600); err != nil {
+					t.Fatalf("restore the control-plane database %s: %v", path, err)
+				}
+				assertNoMaintenanceRecordIn(t, path, nodeName)
+			},
+			reason:   "control-plane database",
+			exitCode: 1,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			database, declared := testCase.database(t)
+			arguments := []string{
+				"upgrade", "platform",
+				"--kubeconfig", kubeconfig,
+				"--definitions", definitions,
+				"--installed-framework", "1.0",
+				"--node", nodeName,
+				"--version", targetVersion,
+				"--downtime", downtime,
+				"--poll", "20ms",
+				"--node-wait", "5s",
+			}
+			if declared {
+				arguments = append(arguments, "--identity-database", database)
+			}
+			since := time.Now()
+			output, err := exec.Command(binary, arguments...).CombinedOutput()
+			var refused *exec.ExitError
+			if !errors.As(err, &refused) || refused.ExitCode() != testCase.exitCode {
+				t.Fatalf("upgrade without a usable control-plane database = %v\n%s, want the usage refusal", err, output)
+			}
+			if !strings.Contains(string(output), testCase.reason) {
+				t.Fatalf("refusal %q does not name %q", output, testCase.reason)
+			}
+			// The node takes no maintenance request at all: a write, even one
+			// that stores the value the field already held, would appear here
+			// (ADM-C-56).
+			if writes := nodeWriteRequests(t, cluster, nodeName, since); len(writes) != 0 {
+				t.Fatalf("the refused upgrade sent %d write requests to the node, want none: %+v", len(writes), writes)
+			}
+			if cluster.NodeUnschedulable(t, nodeName) {
+				t.Fatal("the refused upgrade took the node out of scheduling")
+			}
+			assertNoDefinitionReplaced(t, cluster)
+			if testCase.inspect != nil {
+				testCase.inspect(t, database)
+			}
+		})
+	}
+}
+
+// cordonNode takes a node out of scheduling the way another writer does before
+// an upgrade starts (ADM-C-56).
+func cordonNode(t *testing.T, cluster *harness.Cluster, name string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	nodes := cluster.Direct(t, "", "v1", "Node", "")
+	object, err := nodes.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("read node %q: %v", name, err)
+	}
+	if err := unstructured.SetNestedField(object.Object, true, "spec", "unschedulable"); err != nil {
+		t.Fatalf("cordon node %q: %v", name, err)
+	}
+	if _, err := nodes.Update(ctx, object, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("cordon node %q: %v", name, err)
+	}
+}
+
+// nodeWriteRequests lists the write requests the API server recorded for one
+// node from the given instant, whatever value they carried: a write that leaves
+// the unschedulable field at the value it already held is a request too
+// (C-15, ADM-C-56).
+func nodeWriteRequests(t *testing.T, cluster *harness.Cluster, node string, since time.Time) []install.AuditEvent {
+	t.Helper()
+	events, err := cluster.AuditSource(t).Events(context.Background(), since, time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatalf("read the API server audit log for %s: %v", node, err)
+	}
+	writes := make([]install.AuditEvent, 0)
+	for _, event := range events {
+		if event.Object.Kind == "Node" && event.Object.Name == node {
+			writes = append(writes, event)
+		}
+	}
+	return writes
+}
+
+// buildManagementCLI builds the management artifact the acceptance case runs.
+func buildManagementCLI(t *testing.T) string {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "kosadm")
+	build := exec.Command("go", "build", "-o", binary, "./cmd/kosadm")
+	build.Dir = harness.RepoRoot(t)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build the management CLI: %v\n%s", err, output)
+	}
+	return binary
+}
+
+// writeKubeconfig renders the running cluster as a kubeconfig the management
+// CLI reaches it through.
+func writeKubeconfig(t *testing.T, cluster *harness.Cluster) string {
+	t.Helper()
+	config := cluster.Config
+	user := clientcmdapi.NewAuthInfo()
+	user.ClientCertificateData = certificateOf(t, config.CertData, config.CertFile)
+	user.ClientKeyData = certificateOf(t, config.KeyData, config.KeyFile)
+	user.Token = config.BearerToken
+	user.Username = config.Username
+	user.Password = config.Password
+	kubeconfig := clientcmdapi.NewConfig()
+	kubeconfig.Clusters["acceptance"] = &clientcmdapi.Cluster{
+		Server:                   config.Host,
+		CertificateAuthorityData: certificateOf(t, config.CAData, config.CAFile),
+		InsecureSkipTLSVerify:    config.Insecure,
+	}
+	kubeconfig.AuthInfos["acceptance"] = user
+	kubeconfig.Contexts["acceptance"] = &clientcmdapi.Context{Cluster: "acceptance", AuthInfo: "acceptance"}
+	kubeconfig.CurrentContext = "acceptance"
+	path := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := clientcmd.WriteToFile(*kubeconfig, path); err != nil {
+		t.Fatalf("write the kubeconfig: %v", err)
+	}
+	return path
+}
+
+// certificateOf reads one credential the rest configuration holds inline or on
+// disk.
+func certificateOf(t *testing.T, inline []byte, path string) []byte {
+	t.Helper()
+	if len(inline) > 0 || path == "" {
+		return inline
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read the credential %s: %v", path, err)
+	}
+	return content
+}
+
+// alteredDefinitions copies the release's definition manifests and marks every
+// one with a short name the cluster does not serve; the copy is what the
+// refused upgrade is pointed at, so its application would be visible.
+func alteredDefinitions(t *testing.T, source string) string {
+	t.Helper()
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		t.Fatalf("read the object definition directory %s: %v", source, err)
+	}
+	directory := t.TempDir()
+	marker := []byte("  names:\n")
+	replacement := []byte("  names:\n    shortNames:\n    - " + tamperedShortName + "\n")
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(source, entry.Name()))
+		if err != nil {
+			t.Fatalf("read the object definition %s: %v", entry.Name(), err)
+		}
+		altered := bytes.Replace(content, marker, replacement, 1)
+		if bytes.Equal(altered, content) {
+			t.Fatalf("the object definition %s carries no names block to mark", entry.Name())
+		}
+		if err := os.WriteFile(filepath.Join(directory, entry.Name()), altered, 0o600); err != nil {
+			t.Fatalf("write the altered object definition %s: %v", entry.Name(), err)
+		}
+	}
+	return directory
+}
+
+// assertNoDefinitionReplaced proves the refused upgrade replaced no object
+// definition: no served definition carries the marker the copy declares.
+func assertNoDefinitionReplaced(t *testing.T, cluster *harness.Cluster) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	list, err := cluster.APIExtensions.ApiextensionsV1().CustomResourceDefinitions().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("read the object definitions: %v", err)
+	}
+	if len(list.Items) == 0 {
+		t.Fatal("the cluster serves no object definition")
+	}
+	for _, definition := range list.Items {
+		for _, short := range definition.Spec.Names.ShortNames {
+			if short == tamperedShortName {
+				t.Fatalf("the refused upgrade replaced object definition %s", definition.Name)
+			}
+		}
+	}
+}
+
+// assertNoMaintenanceRecordIn reads the database the CLI was pointed at and
+// proves it holds no maintenance record for the node: the trail the criterion
+// judges is the one the refused upgrade would have written to, not a copy of it
+// (C-14, ADM-C-56).
+func assertNoMaintenanceRecordIn(t *testing.T, path, node string) {
+	t.Helper()
+	store, err := identity.Open(context.Background(), identity.OpenOptions{Path: path})
+	if err != nil {
+		t.Fatalf("open the control-plane database %s the refused upgrade was given: %v", path, err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	entries, err := store.RecentAuditEntriesForObject(context.Background(),
+		api.Group+"/Node/"+node,
+		[]string{controlplane.VerbMaintain, controlplane.VerbRestore},
+		nil, 20)
+	if err != nil {
+		t.Fatalf("read the maintenance trail of %s in %s: %v", node, path, err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("maintenance records in %s = %+v, want none for a refused upgrade", path, entries)
+	}
 }
