@@ -50,7 +50,8 @@ The platform form reads the release the same way an installation does:
   --version <version>        version the nodes report when the operator finished them
   --downtime <duration>      declared per-node downtime estimate, for example 15m
   --identity-database <path> control-plane database the maintenance records go to;
-                             required with --node
+                             required with --node; omitted, the upgrade keeps the
+                             database the installation delivered
 
 A release that stops serving a framework API version is judged against the
 installed extensions before any definition is replaced; both inputs are required:
@@ -95,6 +96,7 @@ type platformFlags struct {
 	image                  string
 	nodeAgentImage         string
 	identityDatabase       string
+	controlPlaneNode       string
 	nodes                  repeated
 	version                string
 	downtime               string
@@ -123,7 +125,9 @@ func (f *platformFlags) register(set *flag.FlagSet) {
 		"node-agent image of the release; empty selects the pinned default")
 	f.packages = assignments{}
 	set.StringVar(&f.identityDatabase, "identity-database", "",
-		"control-plane database the maintenance records are written to; required with --node")
+		"control-plane database the maintenance records go to, read on this host; required with --node; empty keeps the database the installation delivered")
+	set.StringVar(&f.controlPlaneNode, "control-plane-node", "",
+		"node whose filesystem holds --identity-database; it must be the node this command runs on, because the file it opens is this host's")
 	set.Var(&f.nodes, "node", "node the upgrade takes out of scheduling; repeatable")
 	set.StringVar(&f.version, "version", "",
 		"version the upgraded node reports; required with --node")
@@ -182,6 +186,20 @@ func (f *platformFlags) plan(endpoint func() (install.ManagedEndpoint, error)) (
 		Image:          f.image,
 		NodeAgentImage: f.nodeAgentImage,
 	}
+	// An upgrade rewrites the workload, so it has to keep the database delivery
+	// the installation put there: rendering without it would point the control
+	// plane back at an empty database and lose the accounts (C-54, C-63).
+	if f.identityDatabase != "" {
+		// The node is left as the operator named it, or empty; neither is
+		// evidence of where the file is. The run proves the file is this
+		// host's before it pins anything, and an empty value is filled from
+		// the host there.
+		delivery, err := install.SeededDatabase(f.identityDatabase, f.controlPlaneNode)
+		if err != nil {
+			return install.Plan{}, err
+		}
+		plan.Database = &delivery
+	}
 	if !f.external {
 		return plan.Normalize()
 	}
@@ -230,6 +248,34 @@ func runUpgradePlatform(args []string, out io.Writer) error {
 	if err != nil {
 		return exitError{message: err.Error(), code: 2}
 	}
+	// The upgrade re-renders the workload that mounts the database, so the pin
+	// must name a node of the cluster that runs it; otherwise the new pod
+	// starts where the file is not and the accounts are gone.
+	workloadKube := managedClients.kube
+	var controlPlane *install.Cluster
+	if flags.external {
+		controlConfig, err := loadConfig(flags.controlPlaneKubeconfig)
+		if err != nil {
+			return err
+		}
+		controlPlane, err = install.NewCluster(ctx, controlConfig)
+		if err != nil {
+			return fmt.Errorf("build the control-plane cluster clients: %w", err)
+		}
+		workloadKube = controlPlane.Kube
+	}
+	// The upgrade rewrites the workload the installation put there, so it has to
+	// keep the database delivery that workload serves: rendering without it
+	// would point the new pod at the image's own empty database and lose every
+	// account, the first Owner included (C-54, C-63).
+	plan, err = settleUpgradeDelivery(ctx, workloadKube, plan, flags)
+	if err != nil {
+		return err
+	}
+	// The audit store is opened only once the delivery is settled: it is the
+	// file this host holds, and the upgrade has refused by then any delivery
+	// that file cannot be shown to back. Opening it earlier would create or
+	// migrate a database for a run that never replaces anything.
 	var auditor controlplane.Auditor
 	if len(flags.nodes) > 0 {
 		store, closeStore, err := openAudit(ctx, flags.identityDatabase)
@@ -266,22 +312,12 @@ func runUpgradePlatform(args []string, out io.Writer) error {
 	}
 
 	config := install.UpgradeConfig{
-		Plan:          plan,
-		APIExtensions: managedClients.extended,
-		Definitions:   source,
-		Dynamic:       managedClients.dynamic,
-		Frameworks:    frameworks,
-	}
-	if flags.external {
-		controlConfig, err := loadConfig(flags.controlPlaneKubeconfig)
-		if err != nil {
-			return err
-		}
-		controlPlane, err := install.NewCluster(ctx, controlConfig)
-		if err != nil {
-			return fmt.Errorf("build the control-plane cluster clients: %w", err)
-		}
-		config.ControlPlaneCluster = controlPlane
+		Plan:                plan,
+		APIExtensions:       managedClients.extended,
+		Definitions:         source,
+		Dynamic:             managedClients.dynamic,
+		Frameworks:          frameworks,
+		ControlPlaneCluster: controlPlane,
 	}
 	result, upgradeErr := install.Upgrade(ctx, config)
 	printUpgradeResult(out, result)
@@ -297,6 +333,138 @@ func runUpgradePlatform(args []string, out io.Writer) error {
 	}
 	printNodeResults(out, run)
 	return nil
+}
+
+// settleUpgradeDelivery decides the database delivery the upgrade will render,
+// then proves the node that delivery pins holds the file this command opened.
+// The proof runs on the delivery rather than on the flags, because the two
+// differ exactly where the upgrade inherits the served workload's pin (C-54,
+// C-63).
+//
+// The maintenance records go into the file this command opened, and that file
+// is on this host. A node named on the command line says where the replacement
+// should run, not where the file came from: the same absolute path on two nodes
+// is two different files, so a delivery that pins a node this command does not
+// run on would audit one machine's copy while the control plane serves
+// another's. The upgrade refuses that, and it refuses a served delivery whose
+// node nothing observable names, because no pin drawn from this host would keep
+// the file the running pod serves.
+//
+// An operator who names a node but no database asks the replacement to run on a
+// node the upgrade has no file for: the running workload serves its own file on
+// its own node, and naming a different one cannot be shown to read the same
+// account database. That combination is refused instead of being ignored, and
+// so is a delivery whose node the cluster no longer has: either would render a
+// control plane that starts without the accounts the installation wrote.
+func settleUpgradeDelivery(ctx context.Context, kube kubernetes.Interface, plan install.Plan, flags platformFlags) (install.Plan, error) {
+	served, found, err := install.ServedDatabase(ctx, kube, plan.Namespace)
+	if err != nil {
+		return install.Plan{}, err
+	}
+	if found && served.Node == "" {
+		return install.Plan{}, exitError{message: fmt.Sprintf(
+			"the running control plane serves %s but its workload names no node and no running pod shows the node it is on: a hostPath reads one machine's filesystem, so the upgrade cannot show which file a replacement would keep serving; re-install so the workload records the node that holds the database", served.Path), code: 2}
+	}
+	switch {
+	case plan.Database != nil:
+		// The named file is judged before the node it sits on. A location that
+		// cannot hold records is the operator's first problem, and naming it is
+		// more use than a node mismatch behind it (ADM-C-56). The probe writes
+		// nothing: a refused run must not migrate a database it will not use.
+		if err := requireUsableDatabase(plan.Database.Path); err != nil {
+			return install.Plan{}, err
+		}
+		// plan() resolved the file this command opened; the node it is on is the
+		// node this host is, never a value the command line asserts.
+		node, err := databaseNodeOfHost(ctx, kube, plan.Database.Path)
+		if err != nil {
+			return install.Plan{}, err
+		}
+		if plan.Database.Node != "" && plan.Database.Node != node {
+			return install.Plan{}, exitError{message: fmt.Sprintf(
+				"--control-plane-node %s was named, but this command runs on node %s and opened %s there: the same path on %s is another file, so the maintenance records and the owner would come from this host's copy, not from the database the control plane serves; run the upgrade on %s, or name %s",
+				plan.Database.Node, node, plan.Database.Path, plan.Database.Node, plan.Database.Node, node), code: 2}
+		}
+		plan.Database.Node = node
+	case flags.controlPlaneNode != "":
+		return install.Plan{}, exitError{message: fmt.Sprintf(
+			"--control-plane-node %s names a node for a database the upgrade did not name: the running control plane serves %s, which this command cannot show lives on %s; pass --identity-database too, or omit the node to keep the served delivery",
+			flags.controlPlaneNode, servedPath(served, found), flags.controlPlaneNode), code: 2}
+	case found:
+		delivery := served
+		plan.Database = &delivery
+	}
+	if plan.Database == nil {
+		return plan, nil
+	}
+	if found {
+		if err := sameServedDatabase(served, *plan.Database); err != nil {
+			return install.Plan{}, err
+		}
+	}
+	if err := requireNode(ctx, kube, plan.Database.Node); err != nil {
+		return install.Plan{}, err
+	}
+	return plan, nil
+}
+
+// requireUsableDatabase refuses a location the maintenance records cannot be
+// written to, and writes nothing there: the upgrade stops before it replaces
+// anything, and a database it refuses to use is left as it was (ADM-C-56).
+func requireUsableDatabase(path string) error {
+	if err := requireDatabaseFile(path); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open the control-plane database %s: %w", path, err)
+	}
+	return file.Close()
+}
+
+// databaseNodeOfHost names the node this command runs on, which is the only
+// node whose filesystem can hold a file the command opened. A host no node
+// reports cannot be shown to hold the file at all, so the delivery is refused
+// rather than pinned to a guess.
+func databaseNodeOfHost(ctx context.Context, kube kubernetes.Interface, path string) (string, error) {
+	host, err := hostName()
+	if err != nil {
+		return "", fmt.Errorf("read this host's name: %w", err)
+	}
+	node, found, err := install.NodeForHost(ctx, kube, host)
+	if err != nil {
+		return "", fmt.Errorf("find the node that is this host: %w", err)
+	}
+	if !found {
+		return "", exitError{message: fmt.Sprintf(
+			"this command opened --identity-database %s on this host (%s), but no node of the cluster reports that name: the upgrade can only show the file is a node's when this host is that node, so it stops before replacing the workload; run the upgrade on the node that holds the database",
+			path, host), code: 2}
+	}
+	return node, nil
+}
+
+// sameServedDatabase refuses a database the running workload cannot be shown to
+// serve. The same absolute path is the same file only on the same node: two
+// machines that each hold the path hold two different databases, so an upgrade
+// that wrote maintenance records to one while replacing a control plane that
+// serves the other would leave the maintenance invisible to the control plane,
+// or a replacement pod that cannot open the file at all.
+func sameServedDatabase(served, named install.DatabaseDelivery) error {
+	if served.Node == named.Node && served.Path == named.Path {
+		return nil
+	}
+	return exitError{message: fmt.Sprintf(
+		"the upgrade would use %s on node %s as the control-plane database, but the running control plane serves %s on node %s: the same path on two nodes is two different files, so the upgrade cannot show the accounts and maintenance records reach the database it replaces; name the served file with --identity-database %s --control-plane-node %s, or re-install",
+		named.Path, named.Node, served.Path, served.Node, served.Path, served.Node), code: 2}
+}
+
+// servedPath names the database the running workload serves, for a refusal that
+// has to say what the upgrade would otherwise keep.
+func servedPath(served install.DatabaseDelivery, found bool) string {
+	if !found || served.Path == "" {
+		return "no database"
+	}
+	return served.Path
 }
 
 // upgradeFlow builds the node maintenance sequence the platform upgrade drives.
@@ -637,10 +805,14 @@ func upgradeTargets(targets assignments, artifacts extension.MemoryArtifacts) ([
 		if !ok {
 			return nil, fmt.Errorf("target %s names package %q, which --package does not supply", component, reference)
 		}
+		artifact, err := extension.Read(content)
+		if err != nil {
+			return nil, fmt.Errorf("read the package of %s: %w", reference, err)
+		}
 		resolved = append(resolved, extension.UpgradeTarget{
 			Component: component,
 			Reference: reference,
-			Digest:    extension.DigestOf(content),
+			Digest:    artifact.Digest,
 		})
 	}
 	return resolved, nil

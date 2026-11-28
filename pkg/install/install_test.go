@@ -245,6 +245,11 @@ func TestPlanNormalizeRefusesFormsItCannotHonour(t *testing.T) {
 		{name: "existing with nodes", plan: Plan{Mode: ModeExisting, Owner: "owner", Nodes: 3}, wantErr: "declares no nodes"},
 		{name: "bootstrap without nodes", plan: Plan{Mode: ModeBootstrap, Owner: "owner"}, wantErr: "nodes"},
 		{name: "application namespace equals own", plan: Plan{Mode: ModeExisting, Owner: "owner", Namespace: "kos-system", Applications: []string{"kos-system"}}, wantErr: "application namespace"},
+		{name: "database with a relative path", plan: Plan{Mode: ModeExisting, Owner: "owner", Database: &DatabaseDelivery{Path: "kos.db", Node: "node-a"}}, wantErr: "absolute path"},
+		{name: "database naming no file", plan: Plan{Mode: ModeExisting, Owner: "owner", Database: &DatabaseDelivery{Path: "/", Node: "node-a"}}, wantErr: "names no file"},
+		{name: "database delivery without a path", plan: Plan{Mode: ModeExisting, Owner: "owner", Database: &DatabaseDelivery{Node: "node-a"}}, wantErr: "names no file"},
+		{name: "database inside the read-only package directory", plan: Plan{Mode: ModeExisting, Owner: "owner", Database: &DatabaseDelivery{Path: PackageDirectory + "/kos.db", Node: "node-a"}}, wantErr: "read-only for packages"},
+		{name: "database pinned to a name that is not a node", plan: Plan{Mode: ModeExisting, Owner: "owner", Database: &DatabaseDelivery{Path: "/var/lib/kosd/kos.db", Node: "Node_A"}}, wantErr: "not a node name"},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {

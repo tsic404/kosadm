@@ -25,7 +25,13 @@ import (
 // target without a supplied artifact is refused before anything is written, and
 // a supplied one carries the digest of exactly the bytes it names.
 func TestUpgradeTargetsResolveTheirPackage(t *testing.T) {
-	artifacts := extension.MemoryArtifacts{"registry/demo-2": []byte("declaration")}
+	content, digest, err := extension.Pack(extension.Declaration{
+		Identifier: "demo", Version: "2.0.0", FrameworkVersion: ">=1.0 <2.0",
+	}, nil)
+	if err != nil {
+		t.Fatalf("pack the target declaration: %v", err)
+	}
+	artifacts := extension.MemoryArtifacts{"registry/demo-2": content}
 	targets, err := upgradeTargets(assignments{"demo": "registry/demo-2"}, artifacts)
 	if err != nil {
 		t.Fatalf("resolve targets: %v", err)
@@ -33,12 +39,16 @@ func TestUpgradeTargetsResolveTheirPackage(t *testing.T) {
 	if len(targets) != 1 || targets[0].Component != "demo" {
 		t.Fatalf("targets = %+v, want one entry for demo", targets)
 	}
-	if want := extension.DigestOf([]byte("declaration")); targets[0].Digest != want {
-		t.Fatalf("digest = %q, want %q", targets[0].Digest, want)
+	if targets[0].Digest != digest {
+		t.Fatalf("digest = %q, want %q", targets[0].Digest, digest)
 	}
 
 	if _, err := upgradeTargets(assignments{"demo": "registry/absent"}, artifacts); err == nil {
 		t.Fatal("a target whose package is not supplied was resolved")
+	}
+	unreadable := extension.MemoryArtifacts{"registry/unreadable": []byte("not a package")}
+	if _, err := upgradeTargets(assignments{"demo": "registry/unreadable"}, unreadable); err == nil {
+		t.Fatal("a target whose package cannot be read was resolved")
 	}
 }
 
@@ -141,9 +151,96 @@ func TestPlatformFlagsRefuseAnUpgradeItCannotHonour(t *testing.T) {
 			}
 		})
 	}
-	valid := platformFlags{definitions: "definitions", installedFrameworks: repeated{"1.0"}, nodes: repeated{"node-a"}, version: "v1.38.0", downtime: "10m", identityDatabase: "kos.db"}
+	valid := platformFlags{definitions: "definitions", installedFrameworks: repeated{"1.0"}, nodes: repeated{"node-a"}, version: "v1.38.0", downtime: "10m", identityDatabase: "kos.db", controlPlaneNode: "node-a"}
 	if err := valid.validate(); err != nil {
 		t.Fatalf("a complete platform upgrade was refused: %v", err)
+	}
+}
+
+// TestPlatformFlagsKeepAPlatformOnlyUpgradeUsable pins the external surface an
+// operator already has: a platform upgrade that takes no node out and names no
+// database is the shape the release shipped before, and it must keep working.
+// Requiring the database unconditionally turned every such call into a usage
+// error, on a single node as well, which is a contract change the release never
+// declared (ADM-C-55).
+func TestPlatformFlagsKeepAPlatformOnlyUpgradeUsable(t *testing.T) {
+	platformOnly := platformFlags{definitions: "definitions", installedFrameworks: repeated{"1.0"}}
+	if err := platformOnly.validate(); err != nil {
+		t.Fatalf("a platform-only upgrade was refused: %v", err)
+	}
+	// The database stays required where the flow writes maintenance records
+	// into it, which is exactly the node form (ADM-C-56).
+	nodeForm := platformFlags{definitions: "definitions", installedFrameworks: repeated{"1.0"}, nodes: repeated{"node-a"}, version: "v1.38.0"}
+	if err := nodeForm.validate(); err == nil {
+		t.Fatal("a node upgrade without the control-plane database was accepted")
+	}
+}
+
+// TestPlatformUpgradeKeepsTheDatabaseDelivery pins the upgrade side of the same
+// chain: an upgrade rewrites the control-plane workload, so it must render the
+// database the installation seeded. Without it the new pod would open an empty
+// database and every account, the first Owner included, would be gone (C-54).
+func TestPlatformUpgradeKeepsTheDatabaseDelivery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kos.db")
+	if err := os.WriteFile(path, []byte("seeded"), 0o600); err != nil {
+		t.Fatalf("write the database: %v", err)
+	}
+	flags := platformFlags{
+		definitions:         "definitions",
+		installedFrameworks: repeated{"1.0"},
+		owner:               "owner",
+		identityDatabase:    path,
+		controlPlaneNode:    "node-a",
+	}
+	plan, err := flags.plan(nil)
+	if err != nil {
+		t.Fatalf("build the upgrade plan: %v", err)
+	}
+	if plan.Database == nil || plan.Database.Path != path {
+		t.Fatalf("plan database = %+v, want %s", plan.Database, path)
+	}
+	if plan.Database.Node != "node-a" {
+		t.Fatalf("plan database node = %q, want node-a", plan.Database.Node)
+	}
+}
+
+// TestSameServedDatabaseRefusesTheSamePathOnAnotherNode pins the proof the
+// upgrade needs before it reuses a node: two machines that each hold the
+// database path hold two different files, so the same string cannot stand for
+// the file the running control plane serves.
+func TestSameServedDatabaseRefusesTheSamePathOnAnotherNode(t *testing.T) {
+	served := install.DatabaseDelivery{Path: "/var/lib/kosd/kos.db", Node: "node-a"}
+	named := install.DatabaseDelivery{Path: "/var/lib/kosd/kos.db", Node: "node-b"}
+	err := sameServedDatabase(served, named)
+	var coded exitError
+	if !errors.As(err, &coded) || coded.code != 2 {
+		t.Fatalf("same path on two nodes = %v, want a usage refusal", err)
+	}
+	for _, want := range []string{"node-a", "node-b", "/var/lib/kosd/kos.db"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal %q does not name %q", err, want)
+		}
+	}
+}
+
+// TestSameServedDatabaseRefusesAnotherFileOnTheServedNode pins the other
+// mismatch: the node is the one the workload runs on, but the named path is
+// another database, so the replacement would stop serving the accounts the
+// installation wrote.
+func TestSameServedDatabaseRefusesAnotherFileOnTheServedNode(t *testing.T) {
+	served := install.DatabaseDelivery{Path: "/var/lib/kosd/kos.db", Node: "node-a"}
+	named := install.DatabaseDelivery{Path: "/srv/other.db", Node: "node-a"}
+	if err := sameServedDatabase(served, named); err == nil {
+		t.Fatal("another file on the served node was accepted")
+	}
+}
+
+// TestSameServedDatabaseAcceptsTheServedFileOnItsNode pins the accepted proof:
+// the same node mounting the same path is the same file.
+func TestSameServedDatabaseAcceptsTheServedFileOnItsNode(t *testing.T) {
+	delivery := install.DatabaseDelivery{Path: "/var/lib/kosd/kos.db", Node: "node-a"}
+	if err := sameServedDatabase(delivery, delivery); err != nil {
+		t.Fatalf("the served file on its own node = %v, want accepted", err)
 	}
 }
 

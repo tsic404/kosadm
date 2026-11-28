@@ -47,8 +47,13 @@ The upgrade forms are described by: kosadm upgrade help
 Every form needs the release's object definition manifests:
   --definitions <dir>        directory of the release's CRD manifests
 
-Every install form creates the first Owner in the control-plane database:
-  --identity-database <path> the database the control plane serves
+Every install form creates the first Owner in the control-plane database and
+mounts that same file into the control plane, so the printed password signs in:
+  --identity-database <path> the database the control plane serves (on the
+                             control-plane node)
+  --control-plane-node <name> the node that holds that file; the control plane
+                             is pinned to it, because the file is mounted from
+                             that node's filesystem
 
 The install window (C-15) is measured from the API server audit log:
   --audit-log <path>         the API server's audit log; without it the
@@ -101,6 +106,7 @@ type installFlags struct {
 	kubeconfig       string
 	definitions      string
 	identityDatabase string
+	controlPlaneNode string
 	namespace        string
 	owner            string
 	applications     repeated
@@ -121,6 +127,8 @@ func (f *installFlags) register(set *flag.FlagSet) {
 		"directory of the release's object definition manifests (required)")
 	set.StringVar(&f.identityDatabase, "identity-database", "",
 		"control-plane database the first Owner is created in (required)")
+	set.StringVar(&f.controlPlaneNode, "control-plane-node", "",
+		"node whose filesystem holds --identity-database; the control plane is pinned to it because the file is mounted from that node")
 	set.StringVar(&f.namespace, "namespace", install.DefaultNamespace,
 		"namespace the installation creates for itself")
 	set.StringVar(&f.owner, "owner", "owner", "login name of the first Owner")

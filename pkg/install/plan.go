@@ -2,6 +2,7 @@ package install
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -50,6 +51,15 @@ const (
 	// DefaultAddress is where an external-form control plane answers on its own
 	// host; the first-Owner claim is served from there (C-68).
 	DefaultAddress = "http://127.0.0.1:8080"
+	// PackageDirectory is where the control plane reads extension package files
+	// (C-17). An operator delivers a package by dropping the artifact in this
+	// directory; the component's spec.package.reference is its path below it.
+	PackageDirectory = "/var/lib/kosd/packages"
+	// PackageVolume is the workload volume that carries that directory.
+	PackageVolume = "packages"
+	// DatabaseVolume is the workload volume that carries the control-plane
+	// database the installation seeds.
+	DatabaseVolume = "database"
 )
 
 // Mode is an installation form (C-54).
@@ -73,6 +83,34 @@ type ManagedEndpoint struct {
 	Server string
 	// Authority is the PEM bundle a client verifies that server with.
 	Authority []byte
+}
+
+// DatabaseIdentity is the local account that owns an installation's
+// control-plane database. The workload runs as it, because a mounted database
+// file is writable only by the identity that owns it.
+type DatabaseIdentity struct {
+	// UID is the numeric owner of the database file.
+	UID int64
+	// GID is the numeric group of the database file.
+	GID int64
+}
+
+// DatabaseDelivery is where an installation's control-plane database lives and
+// which local account owns it. The install process writes the first Owner into
+// the file; the rendered workload mounts that file and serves it, so the
+// credential the installation prints signs in against the accounts it wrote
+// (C-54, C-63).
+type DatabaseDelivery struct {
+	// Path is the absolute path of the database file, with every symbolic link
+	// resolved. The workload mounts the file's directory at the path it was
+	// written, so both processes reach one file.
+	Path string
+	// Node is the node whose filesystem holds Path. A hostPath volume reads only
+	// the node the workload runs on, so the workload is pinned to this node;
+	// without the pin a two-node cluster can place it where the file is not.
+	Node string
+	// Owner is the account that owns the file.
+	Owner DatabaseIdentity
 }
 
 // Plan is one installation. It is data: rendering and the install run both
@@ -104,6 +142,13 @@ type Plan struct {
 	// DefaultAddress. The external form prints it with the claim instruction
 	// (C-68).
 	Address string
+	// Database is the control-plane database the installation seeded: the file
+	// the install process opened and the control plane serves (C-54, C-63).
+	// Rendering mounts its directory into the workload and points the process
+	// at it, so the credential the installation prints signs in against the
+	// database it wrote. Nil renders no database delivery, which leaves the
+	// workload on the image's own database.
+	Database *DatabaseDelivery
 }
 
 // Normalize fills the defaults and refuses a plan the install cannot honour.
@@ -151,6 +196,28 @@ func (p Plan) Normalize() (Plan, error) {
 	}
 	if p.NodeAgentImage == "" {
 		p.NodeAgentImage = DefaultNodeAgentImage
+	}
+	if p.Database != nil {
+		if p.Database.Path == "" {
+			return Plan{}, fmt.Errorf("the database delivery names no file")
+		}
+		if !filepath.IsAbs(p.Database.Path) {
+			return Plan{}, fmt.Errorf("control-plane database %q must be an absolute path: the workload mounts it by the same path it was written", p.Database.Path)
+		}
+		if filepath.Dir(p.Database.Path) == p.Database.Path {
+			return Plan{}, fmt.Errorf("control-plane database %q names no file", p.Database.Path)
+		}
+		if p.Database.Path == PackageDirectory || strings.HasPrefix(p.Database.Path, PackageDirectory+"/") {
+			return Plan{}, fmt.Errorf("control-plane database %q is inside %s: the workload mounts that directory read-only for packages, so the database would not be writable", p.Database.Path, PackageDirectory)
+		}
+		// A hostPath is the node's own directory. When the operator names the
+		// node, the workload is pinned to it by name; the delivery may also name
+		// none, which keeps the command usable on a single node where the pin
+		// is unnecessary.
+		if p.Database.Node != "" && len(validation.IsDNS1123Subdomain(p.Database.Node)) > 0 {
+			problems := validation.IsDNS1123Subdomain(p.Database.Node)
+			return Plan{}, fmt.Errorf("control-plane node %q is not a node name: %s", p.Database.Node, problems[0])
+		}
 	}
 	seen := map[string]bool{}
 	applications := make([]string, 0, len(p.Applications))

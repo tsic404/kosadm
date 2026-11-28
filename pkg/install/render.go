@@ -2,6 +2,7 @@ package install
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -294,32 +295,109 @@ func clusterRoleBinding(plan Plan, labels map[string]any) *unstructured.Unstruct
 // controlPlaneDeployment renders the single control-plane replica. C-54 and
 // F13 permit no second replica, so the count is not a plan value. The external
 // form mounts the credential to the managed cluster: the secret is written by
-// the install run and never leaves the control-plane cluster (C-14).
+// the install run and never leaves the control-plane cluster (C-14). Every form
+// mounts the package directory, so an operator delivers an extension artifact
+// by dropping it on the host (C-17). An installation that seeded a database
+// mounts it too: the process serves the file the install wrote, so the
+// credential it prints signs in (C-54, C-63). That mount is a hostPath, which
+// reads one node's filesystem, so the workload is pinned to the node holding
+// the file; an unpinned workload can land elsewhere and serve an empty
+// database. The pin is a required node affinity on the node's own name rather
+// than a nodeName field: nodeName bypasses the scheduler, so a drain would
+// evict the pod and the replacement would be bound straight back onto the node
+// the operator is taking out (KOSD-C-65).
 func controlPlaneDeployment(plan Plan, labels map[string]any) *unstructured.Unstructured {
 	selector := map[string]any{"app": ControlPlaneName}
+	mounts := []any{}
+	volumes := []any{}
+	args := []any{}
+	// The database mount comes first: its directory may be a parent of the
+	// package directory, and a parent mounted after its child would hide it.
+	pinnedNode := ""
+	if plan.Database != nil {
+		directory := filepath.Dir(plan.Database.Path)
+		mounts = append(mounts, map[string]any{
+			"name":      DatabaseVolume,
+			"mountPath": directory,
+		})
+		volumes = append(volumes, map[string]any{
+			"name": DatabaseVolume,
+			"hostPath": map[string]any{
+				"path": directory,
+				"type": "Directory",
+			},
+		})
+		args = append(args, "-database", plan.Database.Path)
+		// The hostPath reads the node the pod lands on, so the workload is
+		// pinned to the exact node that holds the file. The pin names the node
+		// by its identity: a hostname label would break on a node whose name
+		// differs from its label, which is exactly the node it must reach.
+		pinnedNode = plan.Database.Node
+	}
+	mounts = append(mounts, map[string]any{
+		"name":      PackageVolume,
+		"mountPath": PackageDirectory,
+		"readOnly":  true,
+	})
+	volumes = append(volumes, map[string]any{
+		"name": PackageVolume,
+		"hostPath": map[string]any{
+			"path": PackageDirectory,
+			"type": "DirectoryOrCreate",
+		},
+	})
+	args = append(args, "-packages", PackageDirectory)
 	container := map[string]any{
 		"name":  ControlPlaneName,
 		"image": plan.Image,
 		"ports": []any{map[string]any{"containerPort": int64(8080)}},
+		"args":  args,
 	}
-	podSpec := map[string]any{
-		"serviceAccountName": ControlPlaneServiceAccount,
-		"containers":         []any{container},
+	if plan.Database != nil {
+		container["securityContext"] = map[string]any{
+			"runAsUser":  plan.Database.Owner.UID,
+			"runAsGroup": plan.Database.Owner.GID,
+		}
 	}
 	if plan.Mode == ModeExternal {
-		container["volumeMounts"] = []any{map[string]any{
+		mounts = append(mounts, map[string]any{
 			"name":      "managed-credential",
 			"mountPath": "/etc/kos/managed",
 			"readOnly":  true,
-		}}
+		})
 		container["env"] = []any{map[string]any{
 			"name":  "KUBECONFIG",
 			"value": "/etc/kos/managed/" + ManagedCredentialKey,
 		}}
-		podSpec["volumes"] = []any{map[string]any{
+		volumes = append(volumes, map[string]any{
 			"name":   "managed-credential",
 			"secret": map[string]any{"secretName": ManagedCredentialSecret},
-		}}
+		})
+	}
+	container["volumeMounts"] = mounts
+	podSpec := map[string]any{
+		"serviceAccountName": ControlPlaneServiceAccount,
+		"containers":         []any{container},
+		"volumes":            volumes,
+	}
+	if pinnedNode != "" {
+		// A required node affinity selects the node by its name through the
+		// scheduler. A nodeName field would bind the pod without the scheduler,
+		// and a drain would then evict it and have the replacement placed back
+		// on the node being taken out (KOSD-C-65).
+		podSpec["affinity"] = map[string]any{
+			"nodeAffinity": map[string]any{
+				"requiredDuringSchedulingIgnoredDuringExecution": map[string]any{
+					"nodeSelectorTerms": []any{map[string]any{
+						"matchFields": []any{map[string]any{
+							"key":      "metadata.name",
+							"operator": "In",
+							"values":   []any{pinnedNode},
+						}},
+					}},
+				},
+			},
+		}
 	}
 	return object("apps/v1", "Deployment", ControlPlaneName, plan.Namespace, map[string]any{
 		"metadata": map[string]any{"labels": labels},

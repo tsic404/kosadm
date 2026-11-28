@@ -275,13 +275,12 @@ func checkExtensionUpgrade(t *testing.T, cluster *harness.Cluster) {
 			}},
 		},
 	}
-	content, err := extension.Marshal(after)
+	content, digest, err := extension.Pack(after, nil)
 	if err != nil {
-		t.Fatalf("marshal the target declaration: %v", err)
+		t.Fatalf("pack the target declaration: %v", err)
 	}
 	reference := "test://" + product + "-2"
 	artifacts[reference] = content
-	digest := extension.DigestOf(content)
 
 	preflight, err := cluster.ExtensionInstaller(artifacts).UpgradePreflight(context.Background(), []extension.UpgradeTarget{{
 		Component: product, Reference: reference, Digest: digest,
@@ -331,14 +330,14 @@ func checkExtensionUpgrade(t *testing.T, cluster *harness.Cluster) {
 			Name: "demo.absent/capability", Versions: "v1",
 		}}},
 	}
-	content, err = extension.Marshal(blocked)
+	content, refusedDigest, err := extension.Pack(blocked, nil)
 	if err != nil {
-		t.Fatalf("marshal the refused declaration: %v", err)
+		t.Fatalf("pack the refused declaration: %v", err)
 	}
 	refusedReference := "test://" + product + "-3"
 	artifacts[refusedReference] = content
 	refused, err := cluster.ExtensionInstaller(artifacts).UpgradePreflight(context.Background(), []extension.UpgradeTarget{{
-		Component: product, Reference: refusedReference, Digest: extension.DigestOf(content),
+		Component: product, Reference: refusedReference, Digest: refusedDigest,
 	}})
 	if err != nil {
 		t.Fatalf("preflight the refused extension upgrade: %v", err)
@@ -848,6 +847,64 @@ func assertNoDefinitionReplaced(t *testing.T, cluster *harness.Cluster) {
 			if short == tamperedShortName {
 				t.Fatalf("the refused upgrade replaced object definition %s", definition.Name)
 			}
+		}
+	}
+}
+
+// definitionVersion is the stored state any write moves, even one that applies
+// identical content: the API server bumps the resource version on every update
+// and the generation whenever the spec changes.
+type definitionVersion struct {
+	resourceVersion string
+	generation      int64
+}
+
+// definitionSnapshot records the stored object definitions a refused upgrade
+// must leave untouched.
+func definitionSnapshot(t *testing.T, cluster *harness.Cluster) map[string]definitionVersion {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	list, err := cluster.APIExtensions.ApiextensionsV1().CustomResourceDefinitions().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("read the object definitions: %v", err)
+	}
+	snapshot := make(map[string]definitionVersion, len(list.Items))
+	for _, definition := range list.Items {
+		snapshot[definition.Name] = definitionVersion{
+			resourceVersion: definition.ResourceVersion,
+			generation:      definition.Generation,
+		}
+	}
+	return snapshot
+}
+
+// assertDefinitionsUnchanged proves the refused upgrade wrote no object
+// definition: every stored definition still carries the snapshot's resource
+// version and generation, and no definition appeared.
+func assertDefinitionsUnchanged(t *testing.T, cluster *harness.Cluster, snapshot map[string]definitionVersion) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	list, err := cluster.APIExtensions.ApiextensionsV1().CustomResourceDefinitions().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("read the object definitions: %v", err)
+	}
+	if len(list.Items) != len(snapshot) {
+		t.Fatalf("object definitions = %d, want the %d the refused upgrade found", len(list.Items), len(snapshot))
+	}
+	for _, definition := range list.Items {
+		before, found := snapshot[definition.Name]
+		if !found {
+			t.Fatalf("the refused upgrade created object definition %s", definition.Name)
+		}
+		if definition.ResourceVersion != before.resourceVersion {
+			t.Fatalf("the refused upgrade wrote object definition %s: resourceVersion %s -> %s",
+				definition.Name, before.resourceVersion, definition.ResourceVersion)
+		}
+		if definition.Generation != before.generation {
+			t.Fatalf("the refused upgrade changed object definition %s: generation %d -> %d",
+				definition.Name, before.generation, definition.Generation)
 		}
 	}
 }

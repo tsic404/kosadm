@@ -66,6 +66,11 @@ func TestTC94ExternalControlPlane(t *testing.T) {
 
 	// The account database is the control plane's own (C-61).
 	accounts := harness.OpenIdentity(t, nil, nil)
+	control.RegisterControlPlaneNode(t)
+	database, err := install.SeededDatabase(accounts.DatabasePath, harness.ControlPlaneNode)
+	if err != nil {
+		t.Fatalf("resolve the database the installation seeds: %v", err)
+	}
 
 	controlClients, err := install.NewCluster(ctx, control.Impersonating(t, installerIdentity))
 	if err != nil {
@@ -75,16 +80,18 @@ func TestTC94ExternalControlPlane(t *testing.T) {
 
 	runner, err := install.New(install.Config{
 		NoNodeAgentController: true,
-		Plan:                  managed.ExternalPlan(nil),
-		Dynamic:               installClients.Dynamic,
-		Kube:                  installClients.Kube,
-		APIExtensions:         installClients.APIExtensions,
-		Definitions:           harness.Definitions(t),
-		ExternalAccounts:      accounts.Service,
-		ControlPlaneCluster:   controlClients,
-		Audit:                 managed.AuditSource(t),
-		QuietWindow:           200 * time.Millisecond,
-		SettleTimeout:         30 * time.Second,
+		Plan: managed.ExternalPlan(func(plan *install.Plan) {
+			plan.Database = &database
+		}),
+		Dynamic:             installClients.Dynamic,
+		Kube:                installClients.Kube,
+		APIExtensions:       installClients.APIExtensions,
+		Definitions:         harness.Definitions(t),
+		ExternalAccounts:    accounts.Service,
+		ControlPlaneCluster: controlClients,
+		Audit:               managed.AuditSource(t),
+		QuietWindow:         200 * time.Millisecond,
+		SettleTimeout:       30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("build installer: %v", err)
@@ -114,7 +121,7 @@ func TestTC94ExternalControlPlane(t *testing.T) {
 	// identity the control plane acts as.
 	assertManagedClusterKeepsReconciliationInputs(t, managed, ctx)
 	// The control-plane cluster runs the workload and holds the credential.
-	assertControlPlaneCluster(t, control, result.Steps)
+	assertControlPlaneCluster(t, control, result.Steps, database)
 
 	// The credential reaches the managed cluster as the control-plane identity,
 	// never as the installer that wrote it (C-04, C-14).
@@ -263,7 +270,7 @@ func assertManagedClusterKeepsReconciliationInputs(t *testing.T, managed *harnes
 
 // assertControlPlaneCluster checks the workload and the credential the other
 // cluster holds.
-func assertControlPlaneCluster(t *testing.T, control *harness.Cluster, steps []string) {
+func assertControlPlaneCluster(t *testing.T, control *harness.Cluster, steps []string, database install.DatabaseDelivery) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -272,6 +279,8 @@ func assertControlPlaneCluster(t *testing.T, control *harness.Cluster, steps []s
 		t.Fatalf("the control-plane cluster runs no workload: %v", err)
 	}
 	assertCredentialMount(t, deployment)
+	harness.AssertPackageDirectory(t, deployment)
+	harness.AssertDatabaseDelivery(t, deployment, database)
 	if _, err := control.Kube.CoreV1().Services(install.DefaultNamespace).Get(ctx, install.ControlPlaneName, metav1.GetOptions{}); err != nil {
 		t.Fatalf("the control-plane cluster serves no API: %v", err)
 	}

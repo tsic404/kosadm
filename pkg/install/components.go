@@ -48,11 +48,11 @@ func ComponentClasses(ctx context.Context, client dynamic.Interface, artifacts e
 		if err != nil {
 			return nil, fmt.Errorf("read the package of component %s: %w", component.GetName(), err)
 		}
-		declaration, err := extension.Parse(content)
+		artifact, err := extension.Read(content)
 		if err != nil {
 			return nil, fmt.Errorf("read the declaration of component %s: %w", component.GetName(), err)
 		}
-		loaded, err := declaration.Load()
+		loaded, err := artifact.Declaration.Load()
 		if err != nil {
 			return nil, fmt.Errorf("load the declaration of component %s: %w", component.GetName(), err)
 		}
